@@ -1,0 +1,62 @@
+{% extends layout|default("base.html") %}
+{% from "macros/components.html" import kpi_card, badge %}
+{% block content %}
+        <div class="max-w-7xl mx-auto px-8 py-8">
+
+          <!-- Hero (제목 행 h-11 고정 + hero-line — 전 페이지 동일 배치) -->
+          <div class="mb-8">
+            <div class="flex items-center justify-between h-11">
+              <h1 class="text-3xl font-extrabold flex items-center gap-4"><iconify-icon icon="solar:widget-bold" width="30" style="color: var(--primary);"></iconify-icon>대시보드</h1>
+              <button class="tds-btn-muted text-sm"
+                      hx-get="/" hx-target="#main-content" hx-swap="innerHTML">
+                <iconify-icon icon="solar:refresh-bold" width="16"></iconify-icon>
+                새로고침
+              </button>
+            </div>
+            <div class="hero-line mt-4"></div>
+          </div>
+
+
+          <!-- 최근 활동 + 시스템 상태 -->
+          <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
+
+            <div class="xl:col-span-2 tds-card p-6">
+              <div class="font-extrabold mb-4">최근 활동</div>
+              {% if recent %}
+              <div class="space-y-3">
+                {% for it in recent %}
+                <div class="flex items-start gap-3">
+                  <div class="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style="background: var(--muted);">
+                    <iconify-icon icon="{{ it.icon }}" width="16" style="color: var(--primary);"></iconify-icon>
+                  </div>
+                  <div class="flex-1 min-w-0">
+                    <div class="text-sm">{{ it.text }}</div>
+                  </div>
+                  {% if it.badge %}<span class="tds-badge badge-muted">{{ it.badge }}</span>{% endif %}
+                </div>
+                {% endfor %}
+              </div>
+              {% else %}
+              <p class="text-sm" style="color: var(--muted-foreground);">아직 활동 기록이 없어요</p>
+              {% endif %}
+            </div>
+
+            <div class="tds-card p-6">
+              <div class="font-extrabold mb-4">시스템 상태</div>
+              <div class="space-y-3">
+                {% for c in components %}
+                <div class="flex items-center justify-between">
+                  <span class="text-sm">{{ c.name }}</span>
+                  <span class="tds-badge badge-success">{{ c.status }}</span>
+                </div>
+                {% endfor %}
+                <div class="flex items-center justify-between">
+                  <span class="text-sm">EKS 노드</span>
+                  <span class="tds-badge badge-success">{{ node_count }} nodes</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+{% endblock %}

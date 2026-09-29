@@ -1,0 +1,693 @@
+"""실험 생성/중지/워처/SSE — stub 모드(기본)."""
+import logging
+from datetime import datetime, timezone
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.db.database import Base
+from app.db.models import App, Experiment
+from app.db.repositories import AppRepository, ExperimentRepository
+
+
+@pytest.fixture(autouse=True)
+def _reset_sse_app_status():
+    """sse_starlette의 AppStatus.should_exit_event를 테스트 간 초기화.
+
+    TestClient가 테스트마다 새 이벤트 루프를 생성하므로, 이전 루프에서
+    만들어진 anyio.Event는 재사용 시 RuntimeError(bound to different loop)를
+    일으킨다. 각 테스트 전·후 None으로 리셋해 다음 루프에서 새로 생성되게 함.
+    (tests/test_builds.py와 동일 패턴.)
+    """
+    try:
+        from sse_starlette.sse import AppStatus
+        AppStatus.should_exit_event = None
+        AppStatus.should_exit = False
+    except ImportError:
+        pass
+    yield
+    try:
+        from sse_starlette.sse import AppStatus
+        AppStatus.should_exit_event = None
+        AppStatus.should_exit = False
+    except ImportError:
+        pass
+
+
+def test_experiments_page_is_disconnected_workflow_demo(client):
+    resp = client.get("/experiments")
+    assert resp.status_code == 200
+    assert "online-boutique" in resp.text
+    assert "spring-boot-demo" not in resp.text
+    assert "총 12건" not in resp.text
+    assert 'name="chaos_type"' not in resp.text
+    assert "실험 중지" not in resp.text
+    assert 'hx-post="/experiments"' not in resp.text
+    assert "후보 생성 요청할게요" in resp.text   # 새 실험 위저드(2-step)는 유지 — AI 후보 선택형 (ADR-0006)
+
+
+def test_create_experiment_success(client):
+    # seed의 online-boutique(1)에는 running 실험이 이미 있어(409 대상) → 실험 없는 앱(2)으로 검증
+    resp = client.post("/experiments", data={
+        "app_id": "2", "chaos_type": "network-delay",
+        "latency_ms": "200", "duration_s": "30",
+    })
+    assert resp.status_code == 200
+    assert "HYP-1" in resp.text  # 기존 POST가 돌아와도 목록은 가설 Run 행(서버 렌더)
+
+
+def test_create_experiment_validation_error_422(client):
+    resp = client.post("/experiments", data={
+        "app_id": "1", "chaos_type": "network-delay",
+        "latency_ms": "5", "duration_s": "30",  # latency min 10 미만
+    })
+    assert resp.status_code == 422
+
+
+def test_create_experiment_conflict_409_when_app_busy(client):
+    # seed의 online-boutique(1)에는 running 실험이 이미 있음
+    resp = client.post("/experiments", data={
+        "app_id": "1", "chaos_type": "pod-kill",
+    })
+    assert resp.status_code == 409
+
+
+def test_create_experiment_unknown_app_404(client):
+    resp = client.post("/experiments", data={"app_id": "99999", "chaos_type": "pod-kill"})
+    assert resp.status_code == 404
+
+
+def test_stop_running_experiment(client):
+    # seed 실험 1번이 running
+    resp = client.post("/experiments/1/stop")
+    assert resp.status_code == 200
+    assert "HYP-1" in resp.text  # 목록 = 가설 Run 행 (개별 Experiment 행은 백로그)
+
+
+def test_stop_with_next_returns_hx_location(client):
+    """가설 셸 2단계 카드의 중지 버튼 — 목록 대신 next(view)로 htmx 복귀."""
+    import json
+    resp = client.post("/experiments/1/stop", data={"next": "/hypothesis/1?view=execute"})
+    assert resp.status_code == 204
+    loc = json.loads(resp.headers["HX-Location"])
+    assert loc == {"path": "/hypothesis/1?view=execute", "target": "#main-content", "swap": "innerHTML"}
+    assert client.post("/experiments/1/stop").status_code == 409   # 실제로 stopped 처리됨
+
+
+def test_stop_rejects_external_next(client):
+    # 프로토콜 상대 URL(//evil)·절대 URL은 무시하고 기존 목록 응답
+    resp = client.post("/experiments/1/stop", data={"next": "//evil.example/x"})
+    assert resp.status_code == 200 and "HX-Location" not in resp.headers
+
+
+def test_stop_non_running_409(client):
+    client.post("/experiments/1/stop")            # running → stopped
+    assert client.post("/experiments/1/stop").status_code == 409
+
+
+def _engine_session():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def test_watch_experiment_completes_and_cleans(monkeypatch):
+    from app.routers.experiments import _watch_experiment
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(name="demo", repo_url="", framework="docker")
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="pod-kill", params={"action": "pod-kill"},
+        status="running", crd_name="exp-demo-abc")
+    exp_id = exp.id
+    s.close()
+
+    deleted = []
+
+    class _SpyChaos:
+        def phase(self, chaos_type, crd_name):
+            return "recovered"
+        def delete(self, chaos_type, crd_name):
+            deleted.append((chaos_type, crd_name))
+
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: _SpyChaos())
+    monkeypatch.setattr("app.routers.experiments.time.sleep", lambda n: None)
+
+    _watch_experiment(exp_id)
+
+    s = Session()
+    exp = ExperimentRepository(s).get(exp_id)
+    assert exp.status == "completed"
+    assert exp.finished_at is not None
+    # Slice 4: 완주 시 실측 3구간 + R지수가 채워져야 함 (DB 왕복 naive datetime 경로 포함)
+    assert exp.baseline_metrics and exp.fault_metrics and exp.recovery_metrics
+    assert exp.recovery_metrics["recovery_seconds"] is not None
+    assert exp.r_index is not None
+    s.close()
+    assert deleted == [("pod-kill", "exp-demo-abc")]
+
+
+def test_watch_experiment_failure_marks_failed(monkeypatch, caplog):
+    from app.routers.experiments import _watch_experiment
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(name="demo", repo_url="", framework="docker")
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="network-delay",
+        params={"action": "delay", "latency_ms": 200, "duration_s": 30},
+        status="running", crd_name="exp-demo-abc")
+    exp_id = exp.id
+    s.close()
+
+    class _BoomChaos:
+        def phase(self, chaos_type, crd_name):
+            raise RuntimeError("boom")
+        def delete(self, chaos_type, crd_name):
+            return None
+
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: _BoomChaos())
+    monkeypatch.setattr("app.routers.experiments.time.sleep", lambda n: None)
+
+    with caplog.at_level(logging.ERROR):
+        _watch_experiment(exp_id)
+
+    s = Session()
+    assert ExperimentRepository(s).get(exp_id).status == "failed"
+    s.close()
+    assert "experiment watch failed" in caplog.text
+
+
+def test_watch_skips_when_already_stopped(monkeypatch):
+    """이미 stopped인 실험 → 워처가 즉시 종료하고 CRD 재삭제·완료 처리를 하지 않음."""
+    from app.routers.experiments import _watch_experiment
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(name="demo", repo_url="", framework="docker")
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="pod-kill", params={"action": "pod-kill"},
+        status="stopped", crd_name="exp-demo-abc")
+    exp_id = exp.id
+    s.close()
+
+    class _SpyChaos:
+        def __init__(self):
+            self.phase_calls = 0
+            self.delete_calls = 0
+        def phase(self, chaos_type, crd_name):
+            self.phase_calls += 1
+            return "recovered"
+        def delete(self, chaos_type, crd_name):
+            self.delete_calls += 1
+
+    spy = _SpyChaos()
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: spy)
+    monkeypatch.setattr("app.routers.experiments.time.sleep", lambda n: None)
+
+    _watch_experiment(exp_id)
+
+    assert spy.phase_calls == 0
+    assert spy.delete_calls == 0  # CRD 재삭제 없음 — stop이 이미 처리함
+    s = Session()
+    exp = ExperimentRepository(s).get(exp_id)
+    assert exp.status == "stopped"
+    assert exp.finished_at is None
+    s.close()
+
+
+def test_watch_early_exits_when_stopped_midway(monkeypatch):
+    """워처 실행 도중 stop이 처리되면(status running→stopped) 즉시 종료하고 덮어쓰지 않음."""
+    from app.routers.experiments import _watch_experiment
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(name="demo", repo_url="", framework="docker")
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="network-delay",
+        params={"action": "delay", "latency_ms": 200, "duration_s": 30},
+        status="running", crd_name="exp-demo-abc")
+    exp_id = exp.id
+    s.close()
+
+    class _SpyChaos:
+        def __init__(self):
+            self.phase_calls = 0
+            self.delete_calls = 0
+        def phase(self, chaos_type, crd_name):
+            self.phase_calls += 1
+            return "recovered"
+        def delete(self, chaos_type, crd_name):
+            self.delete_calls += 1
+
+    spy = _SpyChaos()
+    sleep_calls = []
+
+    def _fake_sleep(n):
+        sleep_calls.append(n)
+        if len(sleep_calls) == 1:
+            # 첫 폴링 직후 stop 라우트가 처리한 것처럼 DB 상태를 바꿈
+            stop_s = Session()
+            stopped_exp = ExperimentRepository(stop_s).get(exp_id)
+            stopped_exp.status = "stopped"
+            stopped_exp.finished_at = datetime.now(timezone.utc)
+            stop_s.commit()
+            stop_s.close()
+
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: spy)
+    monkeypatch.setattr("app.routers.experiments.time.sleep", _fake_sleep)
+
+    _watch_experiment(exp_id)
+
+    assert sleep_calls  # 최소 한 번은 폴링했음
+    assert spy.phase_calls == 0  # 회복 폴링 루프까지 도달하지 않음
+    assert spy.delete_calls == 0  # CRD 재삭제 없음 — stop이 이미 처리함
+    s = Session()
+    exp = ExperimentRepository(s).get(exp_id)
+    assert exp.status == "stopped"
+    s.close()
+
+
+def _engine_with_experiment(status: str):
+    """단일 App+Experiment(id=1, 주어진 status)를 가진 격리 엔진의 세션메이커.
+
+    tests/test_builds.py의 _engine_with_status와 동일 패턴 — SSE 라우트가
+    쓰는 SessionLocal은 client 픽스처의 override와 분리된 DB를 보므로,
+    라우트가 실제로 조회할 엔진에 직접 시드한다.
+    """
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    s = Session()
+    app = App(name="demo", repo_url="https://github.com/x/demo", framework="docker")
+    s.add(app)
+    s.commit()
+    s.add(Experiment(app_id=app.id, chaos_type="pod-kill", status=status))
+    s.commit()
+    s.close()
+    return Session
+
+
+def test_experiment_stream_completed_immediately(monkeypatch, client):
+    # 격리 엔진에 stopped 실험(id=1)을 시드하고 스트림 접속 → 즉시 completed 이벤트
+    Session = _engine_with_experiment("stopped")
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    with client.stream("GET", "/experiments/1/stream") as r:
+        body = "".join(chunk for chunk in r.iter_text())
+    assert "event: completed" in body
+    assert '"status": "stopped"' in body
+
+
+def _sse_events(text: str) -> list[tuple[str, dict]]:
+    """SSE 본문 → [(event, data dict)] — 빈 줄로 구분된 블록 파싱."""
+    import json
+
+    out = []
+    for block in text.replace("\r\n", "\n").strip().split("\n\n"):
+        ev, data = None, None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                ev = line[7:]
+            elif line.startswith("data: "):
+                data = json.loads(line[6:])
+        if ev:
+            out.append((ev, data))
+    return out
+
+
+_LIVE_KEYS = {"ts", "rps", "error_rate_pct", "p95_ms", "p99_ms", "ready_pods", "status"}
+
+
+def test_metrics_stream_completed_immediately_when_not_active(monkeypatch, client):
+    Session = _engine_with_experiment("completed")
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    with client.stream("GET", "/experiments/1/metrics/stream") as r:
+        events = _sse_events("".join(r.iter_text()))
+    assert events == [("completed", {"status": "completed"})]
+
+
+def _flip_status_on_nth_session(Session, n: int, status: str):
+    """TestClient는 스트림 본문을 응답 종료까지 모아서 돌려주므로 중간에 DB를 바꿀 수 없다 —
+    라우트가 n번째로 SessionLocal()을 열기 직전에 실험 status를 바꿔 종료를 유도한다."""
+    calls = {"n": 0}
+
+    def factory():
+        calls["n"] += 1
+        if calls["n"] == n:
+            s = Session()
+            s.get(Experiment, 1).status = status
+            s.commit()
+            s.close()
+        return Session()
+
+    return factory
+
+
+def test_metrics_stream_emits_metric_then_completed(monkeypatch, client):
+    # running → 첫 이벤트는 계약 키를 가진 metric(Stub 즉시값), 완료로 바뀌면 completed로 종료
+    Session = _engine_with_experiment("running")
+    monkeypatch.setattr("app.routers.experiments.SessionLocal",
+                        _flip_status_on_nth_session(Session, 3, "completed"))
+    monkeypatch.setattr("app.routers.experiments._LIVE_INTERVAL_S", 0)
+    with client.stream("GET", "/experiments/1/metrics/stream") as r:
+        events = _sse_events("".join(r.iter_text()))
+    assert [ev for ev, _ in events] == ["metric", "metric", "completed"]
+    data = events[0][1]
+    assert set(data) == _LIVE_KEYS
+    assert data["status"] == "running"
+    assert isinstance(data["rps"], float) and isinstance(data["ready_pods"], int)
+    assert events[-1][1] == {"status": "completed"}
+
+
+def test_metrics_stream_resolves_prometheus_by_app_env(monkeypatch, client):
+    """k3s 앱이면 make_prometheus("k3s") — env별 구현체(LocalPrometheus/Real/Stub) 라우팅은 팩토리 한 곳."""
+    Session = _engine_with_experiment("running")
+    s = Session()
+    s.get(App, 1).env = "k3s"
+    s.commit(); s.close()
+    monkeypatch.setattr("app.routers.experiments.SessionLocal",
+                        _flip_status_on_nth_session(Session, 2, "completed"))
+    monkeypatch.setattr("app.routers.experiments._LIVE_INTERVAL_S", 0)
+    seen = []
+
+    def _factory(env="eks"):
+        seen.append(env)
+        from app.services.stubs import StubPrometheus
+        return StubPrometheus()
+
+    monkeypatch.setattr("app.routers.experiments.make_prometheus", _factory)
+    with client.stream("GET", "/experiments/1/metrics/stream") as r:
+        events = _sse_events("".join(r.iter_text()))
+    assert [ev for ev, _ in events] == ["metric", "completed"]
+    assert seen == ["k3s"]                                  # 스트림당 한 번, 앱 env로
+
+
+def test_metrics_stream_pending_sends_none_values(monkeypatch, client):
+    # k3s 배포 전(pending)이면 값 None인 metric 틱 — 스트림은 유지되고 Prometheus는 조회하지 않는다
+    Session = _engine_with_experiment("pending")
+    monkeypatch.setattr("app.routers.experiments.SessionLocal",
+                        _flip_status_on_nth_session(Session, 2, "stopped"))
+    monkeypatch.setattr("app.routers.experiments._LIVE_INTERVAL_S", 0)
+
+    def _boom(*a, **k):
+        raise AssertionError("pending 상태에서는 live_snapshot을 호출하지 않는다")
+
+    monkeypatch.setattr("app.services.stubs.StubPrometheus.live_snapshot", _boom)
+    with client.stream("GET", "/experiments/1/metrics/stream") as r:
+        events = _sse_events("".join(r.iter_text()))
+    assert [ev for ev, _ in events] == ["metric", "completed"]
+    data = events[0][1]
+    assert data["status"] == "pending"
+    assert all(data[k] is None for k in ("rps", "error_rate_pct", "p95_ms", "p99_ms", "ready_pods"))
+
+
+def test_watch_k3s_experiment_deploys_injects_and_tears_down(monkeypatch):
+    """ADR-0009: k3s 워처는 배포→ready→주입→관측→CRD 삭제→ns 삭제 순서로 전체 수행."""
+    from app.routers.experiments import _watch_experiment
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(
+        name="msa", repo_url="k3s://manifest-upload", framework="manifest",
+        env="k3s", manifest="kind: Deployment")
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="pod-kill", params={"action": "pod-kill"},
+        status="deploying", namespace="chaoslab-msa-1")
+    exp_id = exp.id
+    s.close()
+
+    calls = []
+
+    class _SpyWorkload:
+        def deploy(self, ns, manifest):
+            calls.append(("deploy", ns, manifest))
+        def wait_ready(self, ns, timeout_s=180):
+            calls.append(("ready", ns))
+            return True
+        def teardown(self, ns):
+            calls.append(("teardown", ns))
+
+    class _SpyChaos:
+        def inject(self, ns, app_name, chaos_type, params, target_selector=None):
+            calls.append(("inject", ns, target_selector))   # 후보 없는 단독 실험 → ns 전체(None)
+            return "exp-msa-xyz"
+        def phase(self, chaos_type, crd_name):
+            return "recovered"
+        def delete(self, chaos_type, crd_name):
+            calls.append(("delete-crd", crd_name))
+
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: _SpyChaos())
+    monkeypatch.setattr("app.routers.experiments.make_k3s_workload", lambda: _SpyWorkload())
+    monkeypatch.setattr("app.routers.experiments.time.sleep", lambda n: None)
+
+    _watch_experiment(exp_id)
+
+    s = Session()
+    exp = ExperimentRepository(s).get(exp_id)
+    assert exp.status == "completed"
+    assert exp.crd_name == "exp-msa-xyz"
+    s.close()
+    kinds = [c[0] for c in calls]
+    assert kinds == ["deploy", "ready", "inject", "delete-crd", "teardown"]
+    assert calls[0][1] == "chaoslab-msa-1" and calls[0][2] == "kind: Deployment"
+
+
+def test_watch_k3s_deploy_failure_marks_failed_and_tears_down(monkeypatch, caplog):
+    from app.routers.experiments import _watch_experiment
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(
+        name="msa", repo_url="k3s://manifest-upload", framework="manifest",
+        env="k3s", manifest="")
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="pod-kill", params={"action": "pod-kill"},
+        status="deploying", namespace="chaoslab-msa-1")
+    exp_id = exp.id
+    s.close()
+
+    torn = []
+
+    class _BoomWorkload:
+        def deploy(self, ns, manifest):
+            raise ValueError("manifest 비어 있음")
+        def wait_ready(self, ns, timeout_s=180):
+            return True
+        def teardown(self, ns):
+            torn.append(ns)
+
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: object())
+    monkeypatch.setattr("app.routers.experiments.make_k3s_workload", lambda: _BoomWorkload())
+    monkeypatch.setattr("app.routers.experiments.time.sleep", lambda n: None)
+
+    with caplog.at_level(logging.ERROR):
+        _watch_experiment(exp_id)
+
+    s = Session()
+    assert ExperimentRepository(s).get(exp_id).status == "failed"
+    s.close()
+    assert torn == ["chaoslab-msa-1"]  # 실패해도 ns 정리
+
+
+def test_watch_marks_failed_when_never_recovered(monkeypatch):
+    """회복 상한까지 recovered가 안 오면(주입 실패 등) completed가 아니라 failed."""
+    from app.routers.experiments import _watch_experiment
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(name="demo", repo_url="", framework="docker")
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="network-delay",
+        params={"action": "delay", "latency_ms": 100, "duration_s": 30},
+        status="running", crd_name="exp-demo-stuck")
+    exp_id = exp.id
+    s.close()
+
+    deleted = []
+
+    class _StuckChaos:
+        def phase(self, chaos_type, crd_name):
+            return "injecting"  # 영원히 회복 안 됨
+        def delete(self, chaos_type, crd_name):
+            deleted.append(crd_name)
+
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: _StuckChaos())
+    monkeypatch.setattr("app.routers.experiments.time.sleep", lambda n: None)
+
+    _watch_experiment(exp_id)
+
+    s = Session()
+    assert ExperimentRepository(s).get(exp_id).status == "failed"
+    s.close()
+    assert deleted == ["exp-demo-stuck"]  # CRD 정리는 여전히 수행
+
+
+def test_watch_k3s_experiment_targets_candidate_workload(monkeypatch):
+    """가설 후보가 있으면 manifest matchLabels로 대상 파드만 겨냥(ns 전체 mode:one이면 무관한 파드가 죽음)."""
+    from app.db.repositories import HypothesisRepository
+    from app.routers.experiments import _watch_experiment
+    from app.services.agent.hypothesis_schema import CandidateProposal
+
+    Session = _engine_session()
+    s = Session()
+    manifest = ("kind: Deployment\nmetadata:\n  name: order-api\nspec:\n  selector:\n    matchLabels:\n"
+                "      app.kubernetes.io/name: order-api\n---\n"
+                "kind: Deployment\nmetadata:\n  name: payment-api\nspec:\n  selector:\n    matchLabels:\n"
+                "      app.kubernetes.io/name: payment-api\n")
+    app = AppRepository(s).create(name="lab", repo_url="k3s://manifest-upload", framework="manifest",
+                                  env="k3s", manifest=manifest)
+    repo = HypothesisRepository(s)
+    run = repo.create_run(app_id=app.id, goal_text="g", candidate_count=1, input_payload={}, status="ready")
+    [cand] = repo.add_candidates(run.id, [CandidateProposal(
+        title="t", chaos_type="pod-failure", target_workload="payment-api", hypothesis="h", expected_impact="i")])
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="pod-failure", params={"action": "pod-failure", "duration_s": 30},
+        status="deploying", namespace="chaoslab-lab-1", candidate_id=cand.id)
+    exp_id = exp.id
+    s.close()
+
+    seen = {}
+
+    class _Workload:
+        def deploy(self, ns, manifest): pass
+        def wait_ready(self, ns, timeout_s=180): return True
+        def teardown(self, ns): pass
+
+    class _Chaos:
+        def inject(self, ns, app_name, chaos_type, params, target_selector=None):
+            seen["selector"] = target_selector
+            return "crd-1"
+        def phase(self, chaos_type, crd_name): return "recovered"
+        def delete(self, chaos_type, crd_name): pass
+
+    monkeypatch.setattr("app.routers.experiments.SessionLocal", Session)
+    monkeypatch.setattr("app.routers.experiments.make_chaos", lambda *a, **k: _Chaos())
+    monkeypatch.setattr("app.routers.experiments.make_k3s_workload", lambda: _Workload())
+    monkeypatch.setattr("app.routers.experiments.time.sleep", lambda n: None)
+    _watch_experiment(exp_id)
+    assert seen["selector"] == {"app.kubernetes.io/name": "payment-api"}
+
+
+def _k3s_watch_fixture(monkeypatch, *, observe_service="", manifest="kind: Deployment"):
+    """k3s 워처 트래픽 테스트 공용: 앱·실험 생성 + Spy 워크로드/카오스 + TrafficGenerator 스파이."""
+    from app.routers import experiments as mod
+
+    Session = _engine_session()
+    s = Session()
+    app = AppRepository(s).create(
+        name="lab", repo_url="k3s://manifest-upload", framework="manifest",
+        env="k3s", manifest=manifest, health_path="/orders")
+    app.observe_service = observe_service
+    s.commit()
+    exp = ExperimentRepository(s).create(
+        app_id=app.id, chaos_type="pod-kill", params={"action": "pod-kill"},
+        status="deploying", namespace="chaoslab-lab-1")
+    exp_id = exp.id
+    s.close()
+
+    calls = []
+
+    class _SpyWorkload:
+        def deploy(self, ns, manifest): calls.append(("deploy", ns))
+        def wait_ready(self, ns, timeout_s=180): calls.append(("ready", ns)); return True
+        def teardown(self, ns): calls.append(("teardown", ns))
+
+    class _SpyChaos:
+        def inject(self, ns, app_name, chaos_type, params, target_selector=None): return "crd-1"
+        def phase(self, chaos_type, crd_name): return "recovered"
+        def delete(self, chaos_type, crd_name): calls.append(("delete-crd", crd_name))
+
+    class _SpyTraffic:
+        def __init__(self, workload, namespace, observation, interval_s=0.5):
+            calls.append(("traffic-init", namespace, observation))
+        def start(self): calls.append(("traffic-start",)); return self
+        def stop(self, timeout_s=5.0): calls.append(("traffic-stop",))
+
+    monkeypatch.setattr(mod, "SessionLocal", Session)
+    monkeypatch.setattr(mod, "make_chaos", lambda *a, **k: _SpyChaos())
+    monkeypatch.setattr(mod, "make_k3s_workload", lambda: _SpyWorkload())
+    monkeypatch.setattr(mod, "TrafficGenerator", _SpyTraffic)
+    monkeypatch.setattr(mod.time, "sleep", lambda n: None)
+    return mod, Session, exp_id, calls
+
+
+def test_watch_k3s_runs_live_traffic_from_ready_until_before_teardown(monkeypatch):
+    """2단계 차트용 부하: ready 직후 시작 → CRD 삭제 후·ns 삭제 전 중지. 대상은 observe_service·health_path."""
+    mod, Session, exp_id, calls = _k3s_watch_fixture(monkeypatch, observe_service="checkout-api")
+
+    mod._watch_experiment(exp_id)
+
+    kinds = [c[0] for c in calls]
+    assert kinds == ["deploy", "ready", "traffic-init", "traffic-start", "delete-crd", "traffic-stop", "teardown"]
+    assert calls[2][1] == "chaoslab-lab-1"
+    assert calls[2][2] == {"service": "checkout-api", "path": "/orders", "expected_status": 200}
+    s = Session()
+    assert ExperimentRepository(s).get(exp_id).status == "completed"
+    s.close()
+
+
+def test_watch_k3s_stops_live_traffic_on_failure(monkeypatch):
+    """주입 이후 예외(failed 경로)에서도 트래픽은 반드시 중지된다."""
+    mod, Session, exp_id, calls = _k3s_watch_fixture(monkeypatch, observe_service="checkout-api")
+
+    class _BrokenChaos:
+        def inject(self, *a, **k): raise RuntimeError("apiserver down")
+        def delete(self, *a, **k): pass
+
+    monkeypatch.setattr(mod, "make_chaos", lambda *a, **k: _BrokenChaos())
+    mod._watch_experiment(exp_id)
+
+    kinds = [c[0] for c in calls]
+    assert kinds[-2:] == ["traffic-stop", "teardown"]
+    s = Session()
+    assert ExperimentRepository(s).get(exp_id).status == "failed"
+    s.close()
+
+
+def test_watch_k3s_skips_live_traffic_when_service_unknown(monkeypatch, caplog):
+    """관측 Service 미해석(등록값 없음 + manifest 다중 Service) → 경고만, 실험은 정상 완료."""
+    multi = "kind: Service\nmetadata:\n  name: a\n---\nkind: Service\nmetadata:\n  name: b\n"
+    mod, Session, exp_id, calls = _k3s_watch_fixture(monkeypatch, manifest=multi)
+
+    with caplog.at_level("WARNING"):
+        mod._watch_experiment(exp_id)
+
+    kinds = [c[0] for c in calls]
+    assert "traffic-init" not in kinds and "traffic-stop" not in kinds
+    assert kinds == ["deploy", "ready", "delete-crd", "teardown"]
+    assert "live traffic skipped" in caplog.text
+    s = Session()
+    assert ExperimentRepository(s).get(exp_id).status == "completed"
+    s.close()
+
+
+def test_watch_collects_metrics_before_marking_completed(monkeypatch):
+    """status SSE가 completed를 보고 카드를 다시 받아올 때 R지수가 이미 있어야 한다 — 집계가 상태 전환보다 먼저."""
+    mod, Session, exp_id, calls = _k3s_watch_fixture(monkeypatch, observe_service="checkout-api")
+    seen = []
+
+    def _spy_collect(session, exp, prometheus):
+        seen.append(exp.status)          # 집계 시점의 상태
+        exp.r_index = 0.42
+        session.commit()
+
+    monkeypatch.setattr(mod, "collect_experiment_metrics", _spy_collect)
+    mod._watch_experiment(exp_id)
+
+    assert seen == ["running"]
+    s = Session()
+    exp = ExperimentRepository(s).get(exp_id)
+    assert exp.status == "completed" and exp.r_index == 0.42 and exp.finished_at is not None
+    s.close()

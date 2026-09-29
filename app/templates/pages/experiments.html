@@ -1,0 +1,201 @@
+{% extends layout|default("base.html") %}
+{% from "macros/components.html" import framework_icon, env_badge %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto px-8 py-8">
+
+  <div class="mb-8">
+    <div class="flex items-center justify-between h-11">
+      <h1 class="text-3xl font-extrabold flex items-center gap-4">
+        <iconify-icon icon="solar:bug-bold" width="30" style="color: var(--primary);"></iconify-icon>
+        카오스 테스트
+      </h1>
+      <button class="tds-btn-primary" type="button" onclick="openDialog('newExperiment')">
+        <iconify-icon icon="solar:bug-bold" width="18"></iconify-icon>
+        새 실험 시작
+      </button>
+    </div>
+    <div class="hero-line mt-4"></div>
+    <p class="text-base mt-4" style="color: var(--muted-foreground);">검증 목표를 정하고, AI가 제안한 후보를 선택해 순차 실험과 최종 회귀까지 한 흐름으로 확인합니다.</p>
+  </div>
+
+  <div class="grid grid-cols-4 gap-4 mb-5">
+    <div class="tds-card p-5">
+      <div class="text-xs font-bold" style="color: var(--muted-foreground);">전체 실행</div>
+      <div class="text-2xl font-extrabold mt-2">{{ hypothesis_kpi.total }}</div>
+      <div class="text-xs mt-1" style="color: var(--muted-foreground);">가설 수립 기준</div>
+    </div>
+    <div class="tds-card p-5">
+      <div class="text-xs font-bold" style="color: var(--muted-foreground);">내 선택 필요</div>
+      <div class="text-2xl font-extrabold mt-2" style="color: var(--warning);">{{ hypothesis_kpi.needs_choice }}</div>
+      <div class="text-xs mt-1" style="color: var(--muted-foreground);">후보 선택 대기</div>
+    </div>
+    <div class="tds-card p-5">
+      <div class="text-xs font-bold" style="color: var(--muted-foreground);">진행 중</div>
+      <div class="text-2xl font-extrabold mt-2" style="color: var(--primary);">{{ hypothesis_kpi.running }}</div>
+      <div class="text-xs mt-1" style="color: var(--muted-foreground);">생성·구체화·실험 진행</div>
+    </div>
+    <div class="tds-card p-5">
+      <div class="text-xs font-bold" style="color: var(--muted-foreground);">완료</div>
+      <div class="text-2xl font-extrabold mt-2" style="color: var(--success);">{{ hypothesis_kpi.completed }}</div>
+      <div class="text-xs mt-1" style="color: var(--muted-foreground);">실험 완료</div>
+    </div>
+  </div>
+
+  <div class="tds-card p-4 mb-4 flex items-center gap-3">
+    <div class="flex items-center gap-2">
+      <span class="text-xs font-bold" style="color: var(--muted-foreground);">앱</span>
+      <select class="tds-input text-sm h-10 w-44 cursor-not-allowed" disabled><option>모든 앱</option><option selected>online-boutique</option></select>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="text-xs font-bold" style="color: var(--muted-foreground);">단계</span>
+      <select class="tds-input text-sm h-10 w-36 cursor-not-allowed" disabled><option>전체 단계</option><option>후보 선택</option><option>순차 실행</option><option>최종 검증</option><option>결과</option></select>
+    </div>
+    <div class="flex items-center gap-2">
+      <span class="text-xs font-bold" style="color: var(--muted-foreground);">결과</span>
+      <select class="tds-input text-sm h-10 w-40 cursor-not-allowed" disabled><option>모든 결과</option><option>통과</option><option>보완 필요</option><option>검증 불충분</option></select>
+    </div>
+    <div class="flex-1"></div>
+    <span class="text-xs" style="color: var(--muted-foreground);">필터 동작 없음 · 총 {{ hypothesis_kpi.total }}건</span>
+  </div>
+
+  <div class="tds-card overflow-hidden">
+    <table class="w-full text-sm">
+      <thead style="background: var(--muted);">
+        <tr class="text-center text-xs font-bold" style="color: var(--muted-foreground);">
+          <th class="px-5 py-3.5 text-left">실험 목표</th>
+          <th class="px-5 py-3.5">현재 단계</th>
+          <th class="px-5 py-3.5">선택 실험</th>
+          <th class="px-5 py-3.5">판정 요약</th>
+          <th class="px-5 py-3.5">최근 갱신</th>
+          <th class="px-5 py-3.5">상태</th>
+          <th class="px-3 py-3.5"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for run in hypothesis_rows %}
+        <tr class="border-t hover:bg-[var(--sidebar-accent)] cursor-pointer transition" style="border-color: var(--border);"
+            hx-get="/hypothesis/{{ run.id }}?view={{ run.view }}" hx-target="#main-content" hx-swap="innerHTML" hx-push-url="true">
+          <td class="px-5 py-4">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-xl flex items-center justify-center shrink-0" style="background: var(--primary-soft); color: var(--primary);">
+                <iconify-icon icon="solar:shield-check-bold" width="20"></iconify-icon>
+              </div>
+              <div class="min-w-0">
+                <div class="flex items-center gap-2"><span class="font-extrabold">{{ run.code }}</span><span class="text-[11px] mono" style="color: var(--muted-foreground);">{{ run.app_name }}</span></div>
+                <div class="text-xs mt-1 truncate max-w-[400px]" style="color: var(--muted-foreground);">{{ run.goal }}</div>
+              </div>
+            </div>
+          </td>
+          <td class="px-5 py-4 text-center"><div class="font-bold">{{ run.stage }}</div><div class="text-[11px] mt-1" style="color: var(--muted-foreground);">{{ run.step }}</div></td>
+          <td class="px-5 py-4 text-center"><span class="font-bold">{{ run.selected }}</span></td>
+          <td class="px-5 py-4 text-center text-xs mono">{{ run.verdict }}</td>
+          <td class="px-5 py-4 text-center text-xs mono" style="color: var(--muted-foreground);">{{ run.updated }}</td>
+          <td class="px-5 py-4 text-center"><span class="tds-badge {{ run.badge }}">{{ run.status }}</span></td>
+          <td class="px-3 py-4 text-center"><iconify-icon icon="lucide:chevron-right" width="18" style="color: var(--muted-foreground);"></iconify-icon></td>
+        </tr>
+        {% else %}
+        <tr class="border-t" style="border-color: var(--border);">
+          <td colspan="7" class="px-5 py-10 text-center text-sm" style="color: var(--muted-foreground);"><span class="tossface-lg">🧪</span><div class="mt-2">아직 실험이 없어요 — <b>새 실험 시작</b>으로 첫 가설을 만들어 보세요.</div></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- DIALOG: 새 실험 시작 (2-step 위저드 — 대상 앱 → 검증 목표. 설계는 항상 AI 후보 선택형: ADR-0006)
+     제출 시 워크플로우 시안의 후보 선택 단계로 진입 (준비 탭은 제거 — 게이트는 배너로) -->
+<div class="dialog-backdrop" id="dialog-newExperiment">
+  <div class="dialog-card" data-wizard data-wiz-steps="2">
+    <div class="dialog-resize-handle" title="드래그하여 크기 조절">
+      <svg width="20" height="20" viewBox="-2 -2 40 40" fill="none" style="color: var(--primary);">
+        <path d="M 10 34 Q 30 30 34 10" stroke="currentColor" stroke-width="5" fill="none" stroke-linecap="round" />
+      </svg>
+    </div>
+    <div class="px-8 pt-7 pb-4 flex items-center justify-between">
+      <div class="flex items-center gap-2.5">
+        <span class="tossface-lg">🧪</span>
+        <h2 class="font-extrabold text-2xl">새 실험 시작</h2>
+      </div>
+      <button class="p-1 rounded-lg hover:bg-muted" onclick="closeDialog('newExperiment')">
+        <iconify-icon icon="lucide:x" width="20"></iconify-icon>
+      </button>
+    </div>
+
+    <div class="px-8 pb-4 flex items-center justify-center gap-2.5 text-sm font-bold" data-wiz-indicator>
+      {% for num, label in [(1, "대상 앱"), (2, "검증 목표")] %}
+      <div class="flex items-center gap-2" data-wiz-dot="{{ num }}">
+        <span class="w-7 h-7 rounded-full flex items-center justify-center transition-all" data-wiz-circle>{{ num }}</span>
+        <span class="hidden sm:inline" data-wiz-label>{{ label }}</span>
+      </div>
+      {% if not loop.last %}<div class="w-8 h-px shrink-0" style="background: var(--border);"></div>{% endif %}
+      {% endfor %}
+    </div>
+
+    <form onsubmit="event.preventDefault()" novalidate class="flex-1 min-h-0 flex flex-col">
+    <div class="flex-1 overflow-auto px-8 pb-4">
+
+      <!-- step 1: 대상 앱 — 환경은 묻지 않고 앱을 따라온다 (배지 표시) -->
+      <div data-wiz-panel="1" class="space-y-2.5 pt-1">
+        <label class="text-base font-bold mb-1 block">실험을 실행할 앱을 골라 주세요</label>
+        {% for a in apps %}
+        <label class="tds-card p-4 cursor-pointer app-pick-card flex items-center gap-3">
+          <input type="radio" name="app_id" value="{{ a.id }}" data-app-name="{{ a.name }}" class="sr-only" {% if loop.first %}checked{% endif %} />
+          {{ framework_icon(a.framework, 24) }}
+          <div class="flex-1 min-w-0">
+            <div class="font-bold">{{ a.name }}</div>
+            <div class="text-xs mono truncate" style="color: var(--muted-foreground);">{{ a.namespace }}</div>
+          </div>
+          {{ env_badge(a) }}
+        </label>
+        {% endfor %}
+      </div>
+
+      <!-- step 2: 검증 목표 — 설계는 항상 AI 후보 선택형 (ADR-0006) -->
+      <div data-wiz-panel="2" class="hidden space-y-4 pt-2">
+        <div>
+          <label class="text-base font-bold mb-2 block">검증 목표
+            <span class="text-xs font-normal" style="color: var(--muted-foreground);">선택 — AI가 후보를 제안할 때 참고해요</span>
+          </label>
+          <textarea name="objective" rows="3" class="env-textarea"
+            placeholder="예: 주문 API가 파드 장애와 네트워크 지연에도 60초 안에 정상화되면 좋겠어요"></textarea>
+        </div>
+        <details class="rounded-2xl border px-4 py-3" style="border-color: var(--border);">
+          <summary class="text-sm font-bold cursor-pointer">고급 실행 설정
+            <span class="font-normal" style="color: var(--muted-foreground);">후보 5 · 개선 반복 3</span>
+          </summary>
+          <div class="grid grid-cols-2 gap-3 mt-3">
+            <div><label class="text-xs font-bold mb-1 block">후보 수</label>
+              <input name="max_candidates" type="number" min="1" max="10" value="5" class="tds-input mono text-sm h-10" /></div>
+            <div><label class="text-xs font-bold mb-1 block">개선 반복</label>
+              <input name="max_improvements" type="number" min="0" max="10" value="3" class="tds-input mono text-sm h-10" /></div>
+          </div>
+        </details>
+        <div class="p-4 rounded-2xl flex items-start gap-2.5" style="background: var(--primary-soft);">
+          <span class="tossface">🤖</span>
+          <div class="text-sm" style="color: var(--primary-soft-foreground);">
+            요청하면 AI가 앱 구조를 분석해 실험 후보를 제안해요. <span class="font-bold">선택하고 승인한 후보만 실행돼요</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="px-8 py-4 flex items-center justify-between border-t" style="border-color: var(--border);">
+      <button type="button" class="tds-btn-muted text-base" data-wiz-prev>이전</button>
+      <div class="flex items-center gap-2">
+        <button type="button" class="tds-btn-muted text-base" onclick="closeDialog('newExperiment')">닫기</button>
+        <button type="button" class="tds-btn-primary text-base" data-wiz-next>
+          다음
+          <iconify-icon icon="lucide:arrow-right" width="16"></iconify-icon>
+        </button>
+        <button type="button" class="tds-btn-primary text-base hidden" data-wiz-submit data-candidate-request>
+          <iconify-icon icon="solar:magic-stick-3-bold" width="16"></iconify-icon>
+          후보 생성 요청할게요
+        </button>
+      </div>
+    </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
